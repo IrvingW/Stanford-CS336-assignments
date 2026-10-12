@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import regex
 from collections.abc import Iterable, Iterator
 
@@ -5,6 +7,44 @@ from collections.abc import Iterable, Iterator
 # https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py
 GPT2_SPLIT_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 GPT2_SPLIT_PATTERN_RE = regex.compile(GPT2_SPLIT_PATTERN)
+
+
+def _bpe_merge(
+    raw_bytes: bytes, reverse_vocab: dict[bytes, int], merge_ranks: dict[tuple[bytes, bytes], int]
+) -> tuple[int, ...]:
+    byte_list = [bytes([b]) for b in raw_bytes]
+    while True:
+        if len(byte_list) <= 1:
+            break
+        pairs = set(zip(byte_list, byte_list[1:]))
+        if not pairs:
+            break
+
+        # find pair in sequence with lowest rank in merge dict
+        min_rank = float("inf")
+        choose = None
+        for pair in pairs:
+            rank = merge_ranks.get(pair, float("inf"))
+            if rank < min_rank:
+                min_rank = rank
+                choose = pair
+        if choose is None:
+            break
+
+        # replace chosen pair with new bytes
+        merged_bytes = choose[0] + choose[1]
+        new_byte_list = []
+        idx = 0
+        while idx < len(byte_list):
+            if idx < len(byte_list) - 1 and byte_list[idx] == choose[0] and byte_list[idx + 1] == choose[1]:
+                new_byte_list.append(merged_bytes)
+                idx += 2
+            else:
+                new_byte_list.append(byte_list[idx])
+                idx += 1
+        byte_list = new_byte_list
+
+    return tuple(reverse_vocab[b] for b in byte_list)
 
 
 class BPETokenizer:
@@ -27,6 +67,16 @@ class BPETokenizer:
             sorted_special = sorted(self.special_tokens, key=len, reverse=True)
             special_rule = "|".join(map(regex.escape, sorted_special))
             self.special_pattern = regex.compile(f"({special_rule})")
+
+        # LRU cache for bpe merge proces
+        merge_ranks = self.merge_ranks
+        reverse_vocab = self.reverse_vocab
+
+        @lru_cache(maxsize=4096)
+        def bpe_merge_with_cache(raw_bytes: bytes) -> tuple[int, ...]:
+            return _bpe_merge(raw_bytes, reverse_vocab, merge_ranks)
+
+        self.merge_cached = bpe_merge_with_cache
 
     def encode(self, text: str) -> list[int]:
         """Encode a string into a list of token IDs.
@@ -54,46 +104,13 @@ class BPETokenizer:
                 for word in GPT2_SPLIT_PATTERN_RE.findall(chunk):
                     if not word:
                         continue
-                    ids = self._bpe_merge(word.encode("utf-8"))
+                    ids = self._apply_bpe_merge(word.encode("utf-8"))
                     encoded_ids.extend(ids)
 
         return encoded_ids
 
-    def _bpe_merge(self, raw_bytes: bytes) -> list[int]:
-        byte_list = [bytes([b]) for b in raw_bytes]
-
-        while True:
-            if len(byte_list) <= 1:
-                break
-            pairs = set(zip(byte_list, byte_list[1:]))
-            if not pairs:
-                break
-
-            # find pair in sequence with lowest rank in merge dict
-            min_rank = float("inf")
-            choose = None
-            for pair in pairs:
-                rank = self.merge_ranks.get(pair, float("inf"))
-                if rank < min_rank:
-                    min_rank = rank
-                    choose = pair
-            if choose is None:
-                break
-
-            # replace chosen pair with new bytes
-            merged_bytes = choose[0] + choose[1]
-            new_byte_list = []
-            idx = 0
-            while idx < len(byte_list):
-                if idx < len(byte_list) - 1 and byte_list[idx] == choose[0] and byte_list[idx + 1] == choose[1]:
-                    new_byte_list.append(merged_bytes)
-                    idx += 2
-                else:
-                    new_byte_list.append(byte_list[idx])
-                    idx += 1
-            byte_list = new_byte_list
-
-        return [self.reverse_vocab[b] for b in byte_list]
+    def _apply_bpe_merge(self, raw_bytes: bytes) -> tuple[int, ...]:
+        return self.merge_cached(raw_bytes)
 
     def decode(self, ids: Iterable[int]) -> str:
         """Decode a sequence of token IDs back into a string.
