@@ -59,19 +59,62 @@ class RMSNorm(Module):
         result = x * torch.rsqrt(variance + self.eps) * self.alpha
 
         return result.to(in_dtype)
-    
+
+
 class SwiGLU(Module):
-    def __init__(self, d_model: int, d_ff: int, device: torch.device | None = None, dtype: torch.dtype | None=None):
+    def __init__(self, d_model: int, d_ff: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
         self.W1 = nn.Linear(d_model, d_ff, bias=False)
         self.W2 = nn.Linear(d_ff, d_model, bias=False)
         self.W3 = nn.Linear(d_model, d_ff, bias=False)
-    
+
     def _silu(self, x):
         return x * torch.sigmoid(x)
-        
-    def forward(self, x: Tensor)-> Tensor:
+
+    def forward(self, x: Tensor) -> Tensor:
         return self.W2(self._silu(self.W1(x)) * self.W3(x))
-        
+
+
+class RoPEEmbedding(Module):
+    def __init__(
+        self,
+        theta_base: float,
+        d_k: int,
+        max_seq_len: int,
+        device: torch.device | None = None
+    ):
+        super().__init__()
+        self.theta_base = theta_base
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+
+        inv_freq = 1 / (theta_base ** (torch.arange(0, d_k, 2, device=device)[: d_k // 2].float() / d_k))
+        positions = torch.arange(0, max_seq_len, device=device)
+        # (max_seq_len, d_k // 2)
+        angles = torch.outer(positions, inv_freq)
+
+        self.register_buffer("cos_cache", torch.cos(angles), persistent=False)
+        self.register_buffer("sin_cache", torch.sin(angles), persistent=False)
+
+    def forward(self, x: Tensor, token_positions: Tensor) -> Tensor:
+        # (..., seq_len, d_k// 2)
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+
+        # (.., seq_len, d_k // 2)
+        cos = self.get_buffer("cos_cache")[token_positions]
+        sin = self.get_buffer("sin_cache")[token_positions]
+
+        # (..., seq_len, d_k // 2)
+        roated_even = cos * x_even - sin * x_odd
+        roated_odd = sin * x_even + cos * x_odd
+
+        # (..., seq_len, d_k // 2, 2)
+        rotated = torch.stack([roated_even, roated_odd], dim=-1)
+        rotated = rotated.flatten(-2)
+
+        return rotated
+
+
